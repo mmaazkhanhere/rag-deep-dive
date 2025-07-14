@@ -3,17 +3,19 @@ from colorama import Fore, Back, Style
 import logging
 from dotenv import load_dotenv
 
+from pydantic import BaseModel, Field 
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain import hub
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from helper_functions.retrieve_context_per_question import retrieve_context_per_question
 from helper_functions.replace_t_with_space import replace_t_with_space
 
 # Configure logging
@@ -23,6 +25,23 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 file_path = "data/generative_ai_databricks.pdf"
+
+class DocumentMetaData(BaseModel):
+    document_title: str = Field(description="Title of the document")
+    key_topic: str = Field(description="Most important topic in this text segment")
+    key_terms: list[str] = Field(description="Technical terms or entities specific to this text")
+    summary: str = Field(description="1-sentence summary of this specific text segment")
+
+
+def document_metadata_extraction(text: str):
+    """Extract metadata for the document using LLM """
+    llm: ChatGoogleGenerativeAI = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        api_key=os.getenv("GOOGLE_API_KEY")
+    )
+    structure_llm = llm.with_structured_output(DocumentMetaData)
+    return structure_llm.invoke(text)
+
 
 def encode_file(path, chunk_size=1000, chunk_overlap=200):
     """
@@ -52,26 +71,64 @@ def encode_file(path, chunk_size=1000, chunk_overlap=200):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, # how many characters in each chunk
         chunk_overlap=chunk_overlap, # how many characters to overlap between chunks
-        length_function=len # function to calculate the length of the text
+        length_function=len, # function to calculate the length of the text
+        separators=["\n\n", "\n", ". ", "! ", "? ", "; ", " ", ""]
     )
 
-    # Split the documents into chunks
-    texts = text_splitter.split_documents(documents)
-    logger.info(f"{Fore.CYAN}Split documents into {len(texts)} raw text chunks.{Style.RESET_ALL}")
+    all_chunks = []
+    
+    for page_num, doc in enumerate(documents, start=1):
+        page_chunks = text_splitter.split_text(doc.page_content)
 
-    cleaned_texts =replace_t_with_space(texts)  # Clean the text by replacing tabs with spaces
-    logger.info(f"{Fore.CYAN}Cleaned texts resulted in {len(cleaned_texts)} non-empty chunks.{Style.RESET_ALL}")
-    if not cleaned_texts:
-        logger.warning(f"{Fore.YELLOW}No clean text chunks found after splitting and stripping.{Style.RESET_ALL}")
-        return None # Or handle as appropriate
+        for chunk_num, chunk_text in enumerate(page_chunks, start=1):
+            clean_chunk_text = chunk_text.replace('\t', ' ')
+            try:
+                metadata = document_metadata_extraction(clean_chunk_text)
+                logger.info(f"{Fore.BLUE}Extracted metadata for chunk {chunk_num} on page {page_num}{Style.RESET_ALL}")
+            except Exception as e:
+                logger.warning(f"{Fore.YELLOW}Metadata extraction failed for chunk: {e}{Style.RESET_ALL}")
+                metadata = DocumentMetaData(
+                    document_title="Unknown",
+                    key_topic="Unknown",
+                    key_terms=["Unknown"],
+                    summary="Unknown"
+                )
+            
+            header = (
+                f"### CHUNK CONTEXT | Page: {page_num}/{len(documents)} | Chunk: {chunk_num}/{len(page_chunks)} ###\n"
+                f"Key Topics: {metadata.key_topic}\n"  # Fixed: use string directly
+                f"Key Terms: {', '.join(metadata.key_terms)}\n"
+                f"Summary: {metadata.summary}\n\n"
+            )
+
+            contextual_chunk =  header + clean_chunk_text
+            
+            # Create Document object instead of raw string
+            chunk_doc = Document(
+                page_content=contextual_chunk,
+                metadata={
+                    "page": page_num,
+                    "chunk": chunk_num,
+                    "document_title": metadata.document_title,
+                    "key_topic": metadata.key_topic,
+                    "key_terms": metadata.key_terms,
+                    "summary": metadata.summary
+                }
+            )
+            all_chunks.append(chunk_doc)  # Store Document object
+
+
+    logger.info(f"{Fore.CYAN}Created {len(all_chunks)} contextual chunks{Style.RESET_ALL}")
+
+    # for i, chunk in enumerate(all_chunks[:2]):  # Show first 3 chunks
+    #     print(f"\n--- CHUNK {i+1} ({len(chunk)} characters) ---")
 
     # 3. Embed the chunks using HuggingFace embeddings
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
     logger.info(f"{Fore.CYAN}Initialized OpenAIEmbeddings.{Style.RESET_ALL}")
 
     try:
-        # 4. Create a FAISS vector store from the chunks
-        vector_store = FAISS.from_documents(cleaned_texts, embeddings)
+        vector_store = FAISS.from_documents(all_chunks, embeddings)
         logger.info(f"{Fore.GREEN}Successfully created FAISS vector store from documents.{Style.RESET_ALL}")
         return vector_store
     except Exception as e:
@@ -99,12 +156,6 @@ if __name__ == "__main__":
 
             query = input("Enter your question: ")
 
-            prompt_for_query_enhancing = """Given the question '{query}', generate a hypothetical document that directly answers this question. The document should be detailed and in-depth. the document size has be exactly {chunk_size} characters."""
-
-            enhanced_query = llm.invoke(prompt_for_query_enhancing.format(query=query, chunk_size=1000))
-
-            logger.info(f"{Fore.CYAN}Enhanced query: {enhanced_query}{Style.RESET_ALL}")
-
             prompt = hub.pull("langchain-ai/retrieval-qa-chat")
             logger.info(f"{Fore.CYAN}Pulled LangChain hub prompt.{Style.RESET_ALL}")
 
@@ -123,11 +174,6 @@ if __name__ == "__main__":
 
             logger.info(f"{Fore.CYAN}Response from the retrieval chain:{Style.RESET_ALL}")
             print(f"{Fore.MAGENTA}{response['answer']}{Style.RESET_ALL}")
-            # logger.info("Source documents:")
-            # for doc in response['source_documents']:
-            #     print(f"Document: {doc.metadata.get('source', 'Unknown Source')}")
-            #     print(doc.page_content)
-            #     print("\n")
         else:
             logger.error(f"{Fore.RED}Failed to create vector store. Exiting.{Style.RESET_ALL}")
     except Exception as e:
