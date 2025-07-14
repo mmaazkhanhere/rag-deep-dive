@@ -2130,6 +2130,7 @@ name = "rag-deep-dive"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "colorama" },
     { name = "deepeval" },
     { name = "faiss-cpu" },
     { name = "langchain-community" },
@@ -2145,6 +2146,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "colorama", specifier = ">=0.4.6" },
     { name = "deepeval", specifier = "==3.1.0" },
     { name = "faiss-cpu", specifier = "==1.11.0" },
     { name = "langchain-community", specifier = "==0.3.25" },
