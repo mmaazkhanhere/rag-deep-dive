@@ -1,147 +1,78 @@
 import os
-from colorama import Fore, Style
-import logging
+import numpy as np
 from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
 
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_experimental.text_splitter import SemanticChunker
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings  # Updated import
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate  # Added for custom prompt
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from helper_functions.replace_t_with_space import replace_t_with_space
+from helper_functions.show_context import show_context
 
 load_dotenv()
 
-def semantic_chunking_pdf(path, breakpoint_threshold=0.8):
-    """
-    Process PDF using semantic chunking and create vector store
-    
-    Args:
-        path: Path to PDF file
-        breakpoint_threshold: Similarity threshold for chunking (0.7-0.95)
-    
-    Returns:
-        FAISS vector store with semantically chunked documents
-    """
-    logger.info(f"{Fore.CYAN}Starting semantic chunking for: {path}{Style.RESET_ALL}")
-    
-    try:
-        # Load PDF document
-        loader = PyPDFLoader(path)
-        documents = loader.load()
-        logger.info(f"{Fore.GREEN}Loaded {len(documents)} document pages{Style.RESET_ALL}")
-    except Exception as e:
-        logger.error(f"{Fore.RED}PDF loading error: {e}{Style.RESET_ALL}")
-        raise
+path = "data/generative_ai_databricks.pdf"
 
-    # Initialize embeddings model (updated import path)
+def encode_pdf_and_get_split_docs(path, chunk_size=1000, chunk_overlap=200):
+    
+    loader = PyPDFLoader(path)
+    documents = loader.load_and_split()
+    
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    text = text_splitter.split_documents(documents)
+
+    cleaned_text = replace_t_with_space(text)
+
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-mpnet-base-v2"
     )
-    
-    # Create semantic chunker
-    text_splitter = SemanticChunker(
-        embeddings,
-        breakpoint_threshold_type="percentile",
-        breakpoint_threshold_amount=breakpoint_threshold
-    )
-    
-    # Perform semantic chunking
-    try:
-        chunks = text_splitter.split_documents(documents)
-        logger.info(f"{Fore.CYAN}Created {len(chunks)} semantic chunks{Style.RESET_ALL}")
-    except Exception as e:
-        logger.error(f"{Fore.RED}Semantic chunking failed: {e}{Style.RESET_ALL}")
-        raise
 
-    # Create vector store
-    try:
-        vector_store = FAISS.from_documents(chunks, embeddings)
-        logger.info(f"{Fore.GREEN}Vector store created successfully{Style.RESET_ALL}")
-        return vector_store
-    except Exception as e:
-        logger.error(f"{Fore.RED}Vector store creation error: {e}{Style.RESET_ALL}")
-        raise
+    vector_store = FAISS.from_documents(cleaned_text, embeddings)
+    return vector_store, cleaned_text
 
-def get_answer(query, vector_store):
-    """
-    Get answer to a query using the vector store
-    
-    Args:
-        query: User question
-        vector_store: Created vector store
-        
-    Returns:
-        Answer string and source documents
-    """
-    logger.info(f"{Fore.YELLOW}Processing query: {query}{Style.RESET_ALL}")
-    
-    # Initialize LLM
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=0.3
-    )
-    
-    # Create custom prompt that matches our variable names
-    prompt_template = """
-    Use the following context to answer the question at the end.
-    If you don't know the answer, just say that you don't know.
-    
-    Context:
-    {context}
-    
-    Question: {input}
-    """
-    
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-    
-    # Create retrieval chain
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-    document_chain = create_stuff_documents_chain(llm, prompt)
-    retrieval_chain = create_retrieval_chain(retriever, document_chain)
-    
-    # Get response
-    response = retrieval_chain.invoke({"input": query})
-    return response["answer"], response["context"]
 
-if __name__ == "__main__":
-    logger.info(f"{Fore.BLUE}=== Starting Semantic QA System ==={Style.RESET_ALL}")
+def create_bm25_index(documents: list[Document]):
+    tokenized_docs = [doc.page_content.split() for doc in documents]
+    return BM25Okapi(tokenized_docs)
+
+
+def fusion_retrieval(vector_store, bm25, query: str, k: int = 5, alpha: float = 0.5)->list[Document]:
+    epsilon = 1e-8
+
+    # 1. Get all documents from vector store
+    all_docs = vector_store.similarity_search("", k=vector_store.index.ntotal)
     
-    try:
-        # Process PDF with semantic chunking
-        file_path = "data/generative_ai_databricks.pdf"
-        vector_store = semantic_chunking_pdf(file_path, breakpoint_threshold=0.85)
-        
-        # Interactive question answering
-        while True:
-            print(f"\n{Fore.MAGENTA}Enter your question (type 'exit' to quit):{Style.RESET_ALL}")
-            query = input(f"{Fore.CYAN}> {Style.RESET_ALL}")
-            
-            if query.lower() in ['exit', 'quit']:
-                break
-                
-            if not query.strip():
-                continue
-                
-            answer, context_docs = get_answer(query, vector_store)
-            print(f"\n{Fore.GREEN}Answer:{Style.RESET_ALL}")
-            print(f"{Fore.WHITE}{answer}{Style.RESET_ALL}")
-            
-            # Show source information
-            print(f"\n{Fore.YELLOW}Sources:{Style.RESET_ALL}")
-            for i, doc in enumerate(context_docs, 1):
-                source = doc.metadata.get('source', 'Unknown source')
-                page = doc.metadata.get('page', 'N/A')
-                print(f"{i}. {os.path.basename(source)} (page {page+1})")
-            
-    except Exception as e:
-        logger.critical(f"{Fore.RED}Fatal error: {e}{Style.RESET_ALL}")
-    
-    logger.info(f"{Fore.BLUE}=== Session Ended ==={Style.RESET_ALL}")
+    # 2. Perform BM25 search
+    bm25_scores = bm25.get_scores(query.split())
+
+    # 3. Perform vector search
+    vector_results = vector_store.similarity_search_with_score(query, k=len(all_docs))
+
+    # 4. Normalize scores
+
+    vector_scores = np.array([score for _, score in vector_results])
+    vector_scores = 1 - (vector_scores - np.min(vector_scores)) / (np.max(vector_scores) - np.min(vector_scores) + epsilon)
+
+    bm25_scores = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) -  np.min(bm25_scores) + epsilon)
+
+    # 5. Combine scores
+    combined_scores = alpha * vector_scores + (1 - alpha) * bm25_scores  
+
+    # 6. Rank documents
+    sorted_indices = np.argsort(combined_scores)[::-1]
+
+    # 7. return top k documents
+    return [all_docs[i] for i in sorted_indices[:k]]
+
+
+vector_store, cleaned_text = encode_pdf_and_get_split_docs(path)
+bm25 = create_bm25_index(cleaned_text) 
+
+query = input("Ask question: ")
+top_docs = fusion_retrieval(vector_store, bm25, query, k=5, alpha=0.5)
+docs_content = [doc.page_content for doc in top_docs]
+show_context(docs_content)
