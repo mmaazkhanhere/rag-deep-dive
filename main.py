@@ -3,180 +3,102 @@ from colorama import Fore, Back, Style
 import logging
 from dotenv import load_dotenv
 
-from pydantic import BaseModel, Field 
-
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain import hub
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain_core.documents import Document
-
-from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
-
 from langchain_google_genai import ChatGoogleGenerativeAI
 from helper_functions.replace_t_with_space import replace_t_with_space
 
-# Configure logging
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+
 file_path = "data/generative_ai_databricks.pdf"
 
-class DocumentMetaData(BaseModel):
-    document_title: str = Field(description="Title of the document")
-    key_topic: str = Field(description="Most important topic in this text segment")
-    key_terms: list[str] = Field(description="Technical terms or entities specific to this text")
-    summary: str = Field(description="1-sentence summary of this specific text segment")
-
-
-def document_metadata_extraction(text: str):
-    """Extract metadata for the document using LLM """
-    llm: ChatGoogleGenerativeAI = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        api_key=os.getenv("GOOGLE_API_KEY")
-    )
-    structure_llm = llm.with_structured_output(DocumentMetaData)
-    return structure_llm.invoke(text)
-
-
 def encode_file(path, chunk_size=1000, chunk_overlap=200):
-    """
-    This function will encode the PDF file into a vector store using OpenAI embeddings
-
-    Arg:
-    path: PDF book path
-    chunk_size: size of the chunk
-    chunk_overlap: overlap between chunks
-
-    Returns:
-    Vector store
-    """
     logger.info(f"{Fore.CYAN}Starting to encode file: {path}{Style.RESET_ALL}")
-    logger.info(f"{Fore.CYAN}Chunk size: {chunk_size}, Chunk overlap: {chunk_overlap}{Style.RESET_ALL}")
 
-    # 1. Prepare the knowledge base
     try:
-        loader = PyPDFLoader(path) # load the PDF file
+        loader = PyPDFLoader(path)
         documents = loader.load()
-        logger.info(f"{Fore.GREEN}Loaded {len(documents)} pages from the PDF.{Style.RESET_ALL}")
-    except Exception as e:
-        logger.error(f"{Fore.RED}Error loading PDF from {path}: {e}{Style.RESET_ALL}")
-        raise
-    
-    # 2. Split the documents into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size, # how many characters in each chunk
-        chunk_overlap=chunk_overlap, # how many characters to overlap between chunks
-        length_function=len, # function to calculate the length of the text
-        separators=["\n\n", "\n", ". ", "! ", "? ", "; ", " ", ""]
-    )
 
-    all_chunks = []
-    
-    for page_num, doc in enumerate(documents, start=1):
-        page_chunks = text_splitter.split_text(doc.page_content)
+        logger.info(f"{Fore.CYAN}Loaded {len(documents)} pages{Style.RESET_ALL}")
 
-        for chunk_num, chunk_text in enumerate(page_chunks, start=1):
-            clean_chunk_text = chunk_text.replace('\t', ' ')
-            try:
-                metadata = document_metadata_extraction(clean_chunk_text)
-                logger.info(f"{Fore.BLUE}Extracted metadata for chunk {chunk_num} on page {page_num}{Style.RESET_ALL}")
-            except Exception as e:
-                logger.warning(f"{Fore.YELLOW}Metadata extraction failed for chunk: {e}{Style.RESET_ALL}")
-                metadata = DocumentMetaData(
-                    document_title="Unknown",
-                    key_topic="Unknown",
-                    key_terms=["Unknown"],
-                    summary="Unknown"
-                )
-            
-            header = (
-                f"### CHUNK CONTEXT | Page: {page_num}/{len(documents)} | Chunk: {chunk_num}/{len(page_chunks)} ###\n"
-                f"Key Topics: {metadata.key_topic}\n"  # Fixed: use string directly
-                f"Key Terms: {', '.join(metadata.key_terms)}\n"
-                f"Summary: {metadata.summary}\n\n"
-            )
+        # Splitting text
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, length_function=len)
 
-            contextual_chunk =  header + clean_chunk_text
-            
-            # Create Document object instead of raw string
-            chunk_doc = Document(
-                page_content=contextual_chunk,
-                metadata={
-                    "page": page_num,
-                    "chunk": chunk_num,
-                    "document_title": metadata.document_title,
-                    "key_topic": metadata.key_topic,
-                    "key_terms": metadata.key_terms,
-                    "summary": metadata.summary
-                }
-            )
-            all_chunks.append(chunk_doc)  # Store Document object
+        texts = text_splitter.split_documents(documents)
+        logger.info(f"{Fore.CYAN}Split documents into {len(texts)} chunks{Style.RESET_ALL}")
 
+        # Cleaning text
+        cleaned_text = replace_t_with_space(texts)
+        logger.info(f"{Fore.CYAN}Cleaned into {len(cleaned_text)} chunks. {Style.RESET_ALL}")
 
-    logger.info(f"{Fore.CYAN}Created {len(all_chunks)} contextual chunks{Style.RESET_ALL}")
-
-    # for i, chunk in enumerate(all_chunks[:2]):  # Show first 3 chunks
-    #     print(f"\n--- CHUNK {i+1} ({len(chunk)} characters) ---")
-
-    # 3. Embed the chunks using HuggingFace embeddings
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-    logger.info(f"{Fore.CYAN}Initialized OpenAIEmbeddings.{Style.RESET_ALL}")
-
-    try:
-        vector_store = FAISS.from_documents(all_chunks, embeddings)
-        logger.info(f"{Fore.GREEN}Successfully created FAISS vector store from documents.{Style.RESET_ALL}")
+        # Creating embeddings
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        vector_store = FAISS.from_documents(cleaned_text, embeddings)
+        logger.info(f"{Fore.CYAN}Vector store created{Style.RESET_ALL}")
         return vector_store
     except Exception as e:
-        logger.error(f"{Fore.RED}Error creating FAISS vector store: {e}{Style.RESET_ALL}")
+        logger.error(f"{Fore.RED}Error encoding file: {e}{Style.RESET_ALL}")
         raise
 
-
 if __name__ == "__main__":
-    logger.info(f"{Fore.BLUE}--- Starting script execution ---{Style.RESET_ALL}")
-
-    try:
-        chunks_vector_store = encode_file(file_path)
-        if chunks_vector_store:
-            logger.info(f"{Fore.GREEN}Vector store created successfully.{Style.RESET_ALL}")
-            chunks_vector_retriever = chunks_vector_store.as_retriever(search_kwargs={"k": 2})
-            logger.info(f"{Fore.CYAN}Vector store retriever created with k=2.{Style.RESET_ALL}")
-
-            
-            # 5. Initialize the LLM 
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
-                api_key=os.getenv("GOOGLE_API_KEY"),
-            )
-            logger.info(f"{Fore.CYAN}Initialized ChatGoogleGenerativeAI model.{Style.RESET_ALL}")
-
-            query = input("Enter your question: ")
-
-            prompt = hub.pull("langchain-ai/retrieval-qa-chat")
-            logger.info(f"{Fore.CYAN}Pulled LangChain hub prompt.{Style.RESET_ALL}")
-
-            # 6. Create the retrieval chain
-            combine_docs_chain = create_stuff_documents_chain(
-                llm, 
-                prompt
-            )
-            logger.info(f"{Fore.CYAN}Created stuff documents chain.{Style.RESET_ALL}")
-
-            qa_chain =  create_retrieval_chain(chunks_vector_retriever, combine_docs_chain)
-            logger.info(f"{Fore.CYAN}Created retrieval chain.{Style.RESET_ALL}")
-            
-            # 7. Invoke the chain with the query
-            response = qa_chain.invoke({"input": query})
-
-            logger.info(f"{Fore.CYAN}Response from the retrieval chain:{Style.RESET_ALL}")
-            print(f"{Fore.MAGENTA}{response['answer']}{Style.RESET_ALL}")
-        else:
-            logger.error(f"{Fore.RED}Failed to create vector store. Exiting.{Style.RESET_ALL}")
-    except Exception as e:
-        logger.critical(f"{Fore.RED}An unhandled error occurred during script execution: {e}{Style.RESET_ALL}", exc_info=True)
+    logger.info(f"{Fore.CYAN}Starting the main function{Style.RESET_ALL}")
     
-    logger.info(f"{Fore.BLUE}--- Script execution finished ---{Style.RESET_ALL}")
+    vector_store = encode_file(file_path)
+    if not vector_store:
+        logger.error(f"{Fore.RED}Vector store is empty{Style.RESET_ALL}")
+        exit(1)
+
+    # create retriever
+    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+    logger.info(f"{Fore.CYAN}Retriever created{Style.RESET_ALL}")
+
+    # Initialize LLM
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1, api_key = os.getenv("GOOGLE_API_KEY"))
+    logger.info(f"{Fore.CYAN}LLM initialized{Style.RESET_ALL}")
+
+    prompt = hub.pull("langchain-ai/retrieval-qa-chat")
+    qa_chain = create_stuff_documents_chain(llm, prompt)
+    logger.info(f"{Fore.CYAN}QA chain created{Style.RESET_ALL}")
+
+    query = input("\nEnter your question: ")
+    logger.info(f"{Fore.CYAN}User query: {query}{Style.RESET_ALL}")
+
+    HYPO_PROMPT = """Generate a comprehensive document that answers this query: {query}
+        - Create a detailed technical response
+        - Include supporting explanations and examples
+        - Maintain professional academic tone
+        - Target length: ~1000 characters"""
+    
+    hypothetical_docs = llm.invoke(HYPO_PROMPT.format(query=query))
+    logger.info(f"{Fore.CYAN}Hypothetical document generated{Style.RESET_ALL}")
+    logger.info(f"{Fore.YELLOW}{hypothetical_docs.content}{Style.RESET_ALL}")
+
+    context_docs = retriever.get_relevant_documents(hypothetical_docs.content)
+    logger.info(f"{Fore.GREEN}Retrieved {len(context_docs)} context documents.{Style.RESET_ALL}")
+
+    response = qa_chain.invoke({
+            "input": query,
+            "context": context_docs
+        })
+
+    print(f"\n{Back.BLUE}{Fore.WHITE} FINAL ANSWER {Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}{response}{Style.RESET_ALL}")
+    
+    print(f"\n{Back.GREEN}{Fore.BLACK} SOURCE DOCUMENTS {Style.RESET_ALL}")
+    for i, doc in enumerate(context_docs):
+        source = doc.metadata.get('source', 'Unknown')
+        page = doc.metadata.get('page', 'N/A')
+        print(f"{Fore.YELLOW}Source {i+1}: {source} (Page {page}){Style.RESET_ALL}")
+        print(f"{doc.page_content[:250]}...\n")    
+
+    logger.info(f"{Fore.BLUE}--- Pipeline Complete ---{Style.RESET_ALL}")
+
